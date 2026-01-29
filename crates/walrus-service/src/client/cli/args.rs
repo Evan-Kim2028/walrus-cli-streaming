@@ -280,6 +280,24 @@ pub enum CliCommands {
             deserialize_with = "walrus_utils::config::resolve_home_dir_option"
         )]
         out: Option<PathBuf>,
+        /// Starting byte position for a byte-range read (inclusive).
+        #[arg(long)]
+        #[serde(default)]
+        start_byte: Option<u64>,
+        /// Number of bytes to read for a byte-range read.
+        #[arg(long)]
+        #[serde(default)]
+        byte_length: Option<u64>,
+        /// Print the unencoded blob size and exit without streaming blob data.
+        #[arg(long)]
+        #[serde(default)]
+        size_only: bool,
+        /// Stream raw bytes to stdout without buffering the full range in memory.
+        ///
+        /// This is only supported for byte-range reads and disables JSON output.
+        #[arg(long)]
+        #[serde(default)]
+        stream: bool,
         /// The URL of the Sui RPC node to use.
         #[command(flatten)]
         #[serde(flatten)]

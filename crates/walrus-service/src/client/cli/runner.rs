@@ -293,6 +293,10 @@ impl ClientCommandRunner {
             CliCommands::Read {
                 blob_id,
                 out,
+                start_byte,
+                byte_length,
+                size_only,
+                stream,
                 rpc_arg: RpcArg { rpc_url },
                 strict_consistency_check,
                 skip_consistency_check,
@@ -301,7 +305,17 @@ impl ClientCommandRunner {
                     strict_consistency_check,
                     skip_consistency_check,
                 )?;
-                self.read(blob_id, out, rpc_url, consistency_check).await
+                self.read(
+                    blob_id,
+                    out,
+                    start_byte,
+                    byte_length,
+                    size_only,
+                    stream,
+                    rpc_url,
+                    consistency_check,
+                )
+                    .await
             }
 
             CliCommands::ReadQuilt {
@@ -633,10 +647,138 @@ impl ClientCommandRunner {
         self,
         blob_id: BlobId,
         out: Option<PathBuf>,
+        start_byte: Option<u64>,
+        byte_length: Option<u64>,
+        size_only: bool,
+        stream: bool,
         rpc_url: Option<String>,
         consistency_check: ConsistencyCheckType,
     ) -> Result<()> {
         let client = get_read_client(self.config?, rpc_url, self.wallet, &None, None).await?;
+
+        if size_only {
+            ensure!(
+                start_byte.is_none() && byte_length.is_none(),
+                "--size-only cannot be combined with --start-byte or --byte-length"
+            );
+
+            let start_timer = std::time::Instant::now();
+            let metadata_size = async {
+                let status = client
+                    .get_verified_blob_status(&blob_id, client.sui_client(), Duration::from_secs(10))
+                    .await?;
+                if matches!(status, BlobStatus::Nonexistent | BlobStatus::Invalid { .. }) {
+                    return Err(anyhow::anyhow!("blob does not exist or is invalid"));
+                }
+
+                let committees = client.get_committees().await?;
+                let epoch = status
+                    .initial_certified_epoch()
+                    .unwrap_or_else(|| committees.epoch());
+                let metadata = client.retrieve_metadata(epoch, &blob_id).await?;
+                Ok::<u64, anyhow::Error>(metadata.metadata().unencoded_length())
+            }
+            .await;
+
+            let (blob_size, method) = match metadata_size {
+                Ok(size) => (size, "metadata"),
+                Err(err) => {
+                    tracing::warn!(
+                        %blob_id,
+                        error = %err,
+                        "metadata size lookup failed; falling back to byte-range read"
+                    );
+                    let result = client
+                        .byte_range_read_client()
+                        .read_byte_range(&blob_id, 0, 1)
+                        .await?;
+                    (result.unencoded_blob_size, "byte-range")
+                }
+            };
+            let elapsed = start_timer.elapsed();
+            tracing::info!(
+                %blob_id,
+                ?elapsed,
+                blob_size,
+                method,
+                "finished fetching blob size"
+            );
+
+            if self.json {
+                let payload = serde_json::json!({
+                    "blobId": blob_id.to_string(),
+                    "blobSize": blob_size,
+                });
+                println!("{}", payload);
+            } else {
+                println!("{}", blob_size);
+            }
+
+            return Ok(());
+        }
+
+        ensure!(
+            !(start_byte.is_some() ^ byte_length.is_some()),
+            "both --start-byte and --byte-length are required for a byte-range read"
+        );
+
+        if let (Some(start), Some(length)) = (start_byte, byte_length) {
+            if stream {
+                if out.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "--stream cannot be combined with --out; streaming writes to stdout"
+                    ));
+                }
+                if self.json {
+                    return Err(anyhow::anyhow!(
+                        "--stream cannot be combined with --json"
+                    ));
+                }
+                let start_timer = std::time::Instant::now();
+                let mut stdout = std::io::stdout();
+                let meta = client
+                    .byte_range_read_client()
+                    .read_byte_range_to_writer(&blob_id, start, length, &mut stdout)
+                    .await?;
+                let elapsed = start_timer.elapsed();
+                tracing::info!(
+                    %blob_id,
+                    ?elapsed,
+                    range_start = start,
+                    range_length = length,
+                    blob_size = meta.unencoded_blob_size,
+                    bytes_written = meta.bytes_written,
+                    "finished streaming byte range"
+                );
+                return Ok(());
+            }
+
+            let start_timer = std::time::Instant::now();
+            let result = client
+                .byte_range_read_client()
+                .read_byte_range(&blob_id, start, length)
+                .await?;
+            let elapsed = start_timer.elapsed();
+            tracing::info!(
+                %blob_id,
+                ?elapsed,
+                range_start = start,
+                range_length = length,
+                blob_size = result.unencoded_blob_size,
+                "finished reading byte range"
+            );
+
+            match out.as_ref() {
+                Some(path) => std::fs::write(path, &result.data)?,
+                None => {
+                    if !self.json {
+                        std::io::stdout().write_all(&result.data)?
+                    }
+                }
+            }
+
+            return ReadOutput::new(out, blob_id, result.data).print_output(self.json);
+        }
 
         let start_timer = std::time::Instant::now();
         let blob = client

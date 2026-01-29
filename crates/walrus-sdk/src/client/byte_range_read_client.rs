@@ -3,7 +3,7 @@
 
 //! Client for reading byte ranges from blobs.
 
-use std::{num::NonZeroUsize, time::Duration};
+use std::{io::Write, num::NonZeroUsize, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
@@ -67,6 +67,15 @@ pub struct ReadByteRangeResult {
     pub data: Vec<u8>,
     /// The unencoded size of the blob.
     pub unencoded_blob_size: u64,
+}
+
+/// Result metadata for a streamed byte range read.
+#[derive(Debug)]
+pub struct ReadByteRangeMeta {
+    /// The unencoded size of the blob.
+    pub unencoded_blob_size: u64,
+    /// The number of bytes written to the writer.
+    pub bytes_written: usize,
 }
 
 impl<T: ReadClient> ByteRangeReadClient<'_, T> {
@@ -159,6 +168,88 @@ impl<T: ReadClient> ByteRangeReadClient<'_, T> {
         Ok(ReadByteRangeResult {
             data,
             unencoded_blob_size: metadata.metadata().unencoded_length(),
+        })
+    }
+
+    /// Reads a specific byte range from a blob and streams it to the provided writer.
+    pub async fn read_byte_range_to_writer<W: Write + ?Sized>(
+        &self,
+        blob_id: &BlobId,
+        start_byte_position: u64,
+        byte_length: u64,
+        writer: &mut W,
+    ) -> ClientResult<ReadByteRangeMeta> {
+        tracing::debug!(
+            %blob_id,
+            start_byte_position,
+            byte_length,
+            "start streaming byte range"
+        );
+
+        self.client.check_blob_is_blocked(blob_id)?;
+
+        let start_byte_position = usize::try_from(start_byte_position).map_err(|_| {
+            ClientError::from(ClientErrorKind::ByteRangeReadInputError(
+                "start byte position is too large to convert to usize".to_string(),
+            ))
+        })?;
+        let byte_length = NonZeroUsize::new(usize::try_from(byte_length).map_err(|_| {
+            ClientError::from(ClientErrorKind::ByteRangeReadInputError(
+                "byte length is too large to convert to usize".to_string(),
+            ))
+        })?)
+        .ok_or_else(|| {
+            ClientError::from(ClientErrorKind::ByteRangeReadInputError(
+                "byte length cannot be zero".to_string(),
+            ))
+        })?;
+
+        let (certified_epoch, _) = self
+            .client
+            .get_blob_status_and_certified_epoch(blob_id, None)
+            .await?;
+
+        let metadata = self
+            .client
+            .retrieve_metadata(certified_epoch, blob_id)
+            .await?;
+
+        if metadata.metadata().encoding_type() != EncodingType::RS2 {
+            return Err(ClientError::from(ClientErrorKind::ByteRangeReadError(
+                format!(
+                    "byte range read client only supports RS2 encoding, got {}",
+                    metadata.metadata().encoding_type()
+                ),
+            )));
+        }
+
+        let blob_size = usize::try_from(metadata.metadata().unencoded_length()).map_err(|_| {
+            ClientError::from(ClientErrorKind::ByteRangeReadError(format!(
+                "invalid blob size from metadata: {}",
+                metadata.metadata().unencoded_length()
+            )))
+        })?;
+
+        calculate_and_validate_end_byte_position(start_byte_position, byte_length, blob_size)?;
+        let primary_sliver_size = self.get_primary_sliver_size(blob_size, &metadata)?;
+
+        let (new_start_byte_position, sliver_indices) =
+            calculate_sliver_indices(primary_sliver_size, start_byte_position, byte_length)?;
+
+        let slivers = self
+            .retrieve_slivers_for_range(&metadata, &sliver_indices, certified_epoch)
+            .await?;
+
+        let bytes_written = construct_requested_data_into_writer(
+            &slivers,
+            new_start_byte_position,
+            byte_length,
+            writer,
+        )?;
+
+        Ok(ReadByteRangeMeta {
+            unencoded_blob_size: metadata.metadata().unencoded_length(),
+            bytes_written,
         })
     }
 
@@ -353,6 +444,65 @@ fn construct_requested_data_from_slivers(
     }
 
     Ok(result)
+}
+
+/// Constructs the requested data from the slivers and writes it directly to the writer.
+fn construct_requested_data_into_writer<W: Write + ?Sized>(
+    slivers: &[SliverData<Primary>],
+    new_start_byte_position: usize,
+    byte_length: NonZeroUsize,
+    writer: &mut W,
+) -> ClientResult<usize> {
+    let mut bytes_to_skip = new_start_byte_position;
+    let mut bytes_remaining = byte_length.get();
+    let mut bytes_written = 0usize;
+
+    for sliver in slivers {
+        let data = sliver.symbols.data();
+
+        if bytes_to_skip >= data.len() {
+            return Err(ClientError::from(ClientErrorKind::ByteRangeReadError(
+                format!(
+                    "start byte position should be within the first read sliver. start \
+                        position: {}, sliver size: {}",
+                    new_start_byte_position,
+                    data.len(),
+                ),
+            )));
+        }
+
+        let start_in_sliver_inclusive = bytes_to_skip;
+        let end_in_sliver_exclusive = (start_in_sliver_inclusive + bytes_remaining).min(data.len());
+
+        writer
+            .write_all(&data[start_in_sliver_inclusive..end_in_sliver_exclusive])
+            .map_err(|e| ClientError::from(ClientErrorKind::ByteRangeReadError(e.to_string())))?;
+
+        bytes_written += end_in_sliver_exclusive - start_in_sliver_inclusive;
+        bytes_remaining -= end_in_sliver_exclusive - start_in_sliver_inclusive;
+        bytes_to_skip = 0;
+
+        if bytes_remaining == 0 {
+            break;
+        }
+    }
+
+    if bytes_remaining > 0 {
+        return Err(ClientError::from(ClientErrorKind::ByteRangeReadError(
+            format!(
+                "requested byte range is larger than the retrieved slivers: requested {}-{}, \
+                retrieved slivers size is {}",
+                new_start_byte_position,
+                new_start_byte_position + byte_length.get(),
+                slivers
+                    .iter()
+                    .map(|s| s.symbols.data().len())
+                    .sum::<usize>(),
+            ),
+        )));
+    }
+
+    Ok(bytes_written)
 }
 
 #[cfg(test)]
